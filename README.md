@@ -60,9 +60,9 @@ As definições completas estão na [documentação da fonte](https://huggingfac
 
 ## Arquitetura
 
-![Arquitetura do pipeline Snowflake](diagrama_snowflake_pix.png)
+![Arquitetura do pipeline Snowflake](assets/diagrama_snowflake_pix.svg)
 
-Para exibir a imagem no GitHub, mantenha `diagrama_snowflake_pix.png` na mesma pasta deste README.
+Para exibir a imagem no GitHub, mantenha `assets/diagrama_snowflake_pix.svg` no repositório.
 
 | Etapa | Implementação |
 | --- | --- |
@@ -254,7 +254,7 @@ Os caminhos abaixo são uma proposta de organização para os arquivos exportado
 | Caminho | Conteúdo esperado |
 | --- | --- |
 | `README.md` | Documentação do projeto |
-| `diagrama_snowflake_pix.png` | Diagrama de arquitetura |
+| `assets/diagrama_snowflake_pix.svg` | Diagrama de arquitetura |
 | `sql/01_setup.sql` | Banco, schemas e configuração |
 | `sql/02_bronze.sql` | Ingestão e estruturação |
 | `sql/03_thresholds.sql` | Calibração inicial |
