@@ -34,8 +34,8 @@ SELECT
     COUNT(*) AS transacoes,
     SUM(fraude) AS fraudes,
     ROUND(100.0 * SUM(fraude) / NULLIF(COUNT(*), 0), 2) AS taxa_fraude_pct,
-    SUM(valor_brl) AS valor_total_brl,
-    AVG(valor_brl) AS valor_medio_brl
+    SUM(valor_brl) AS valor_total_transacionado,
+    AVG(valor_brl) AS valor_medio_transacao
 FROM SILVER.PIX_TRANSACOES
 GROUP BY nivel_risco;
 
