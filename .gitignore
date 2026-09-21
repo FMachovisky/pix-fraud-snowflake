@@ -1,0 +1,7 @@
+# Dados e evidências locais
+*.parquet
+*.csv
+*.json
+.env
+.DS_Store
+__pycache__/
