@@ -4,7 +4,7 @@ Pipeline de engenharia de dados para análise de risco em transações PIX, impl
 
 Desenvolvido por **Felippe Machoski de Souza**, como a implementação Snowflake de um trabalho acadêmico comparativo. A implementação complementar em Databricks é de Gabriel: [pix-fraud-databricks](https://github.com/GahRizzo/pix-fraud-databricks).
 
-> **Escopo atual:** protótipo batch executado no Snowflake. A carga inicial e as transformações Bronze → Silver → Gold foram acionadas manualmente. Existem duas tarefas agendadas: atualização da Gold de eficácia e recalibração dos thresholds. Isso não equivale, ainda, à orquestração automática de todo o pipeline.
+> **Dois escopos, sem confundir as métricas:** o pipeline principal processou 2.000.000 de registros em batch com carga e transformações iniciais manuais; duas tasks independentes atualizam parte desse ambiente. Além dele, o schema `DEMO_GRAFO_PIX_20260921` contém um **Task Graph manual e isolado** (Bronze → Threshold → Silver → Gold) sobre 10.000 registros. O grafo demonstra dependências, observabilidade e bloqueio da Gold em caso de falha na Silver, mas não automatiza o pipeline principal.
 
 ## Objetivo de negócio
 
@@ -76,6 +76,9 @@ Para exibir a imagem no GitHub, mantenha `assets/diagrama_snowflake_pix.svg` no 
 | Agendamento | Snowflake Tasks e procedure SQL |
 | Compute observado | `COMPUTE_WH`, tamanho X-Small |
 | Consumo demonstrado | Consultas SQL nas tabelas Gold |
+| Grafo demonstrativo | `DEMO_GRAFO_PIX_20260921`: 4 tasks, 10.000 registros e quality gate |
+
+O grafo demonstrativo é descrito em [Workflow do Task Graph](docs/task-graph-demo.md). Ele não substitui as tabelas e os agendamentos do pipeline principal.
 
 O stage `BRONZE.STG_PIX_FRAUD` foi criado durante a preparação. Seu uso efetivo na carga não foi comprovado pelas evidências disponíveis; por isso, não é apresentado como etapa obrigatória do fluxo executado. Kafka, streaming e dashboards externos não fazem parte desta implementação demonstrada.
 
@@ -169,11 +172,11 @@ ORDER BY CHECK_RUN_AT DESC, CHECK_NAME;
 
 ### Comportamento diante de falhas
 
-O roteiro de teste utiliza uma tabela temporária isolada, `SILVER.SILVER_TESTE_FALHA`, na qual um valor é alterado para negativo. O check deve retornar `FAIL`, preservando os dados principais. O print dessa execução deve acompanhar a entrega.
+No **pipeline principal**, `sql/05_quality_checks.sql` registra PASS/FAIL em `CONTROL.QUALITY_CHECK_RESULTS`, mas não interrompe automaticamente a publicação da Gold. O teste isolado em `tests/quality_failure.sql` não altera as tabelas principais.
 
-Na versão atual, registrar `FAIL` **não demonstra um bloqueio automático da Gold**. A evolução prevista é integrar os testes à orquestração, interromper a publicação, preservar a última versão válida e registrar a falha para investigação.
+No **grafo demonstrativo**, a procedure `DEMO_GRAFO_PIX_20260921.BUILD_SILVER()` lança uma exceção quando um check bloqueante falha. Com `INJETAR_FALHA = TRUE`, a Bronze da demo recebe um `VALOR_BRL = 0`; Bronze e Threshold concluem, Silver falha e a task Gold não executa. Após voltar a `FALSE` e rodar novamente, as quatro tasks concluem e a Silver retorna a zero valores inválidos.
 
-Também é necessário incluir um teste explícito para `valor_brl IS NULL`: o predicado `valor_brl <= 0`, isoladamente, não detecta valores nulos. Igualdade de contagens, por sua vez, não comprova igualdade de conteúdo ou ausência de duplicatas.
+**Limite do gate demonstrativo:** a procedure substitui `SILVER_TRANSACOES` antes de validar. Na execução com erro, a Gold mantém os 33 alertas da execução anterior, mas a Silver de demonstração fica temporariamente com uma linha inválida até a recuperação. Isso é diferente do Databricks, que valida antes do MERGE. A publicação atômica da Silver ainda é uma melhoria pendente. Consulte o [runbook da demo](docs/task-graph-demo.md).
 
 ## Gold
 
@@ -193,7 +196,7 @@ SELECT
     TRANSACOES,
     FRAUDES,
     TAXA_FRAUDE_PCT,
-    VALOR_TOTAL_BRL
+    VALOR_TOTAL_TRANSACIONADO
 FROM PIX_FRAUD_DB.GOLD.EFICACIA_RISCO_PIX
 ORDER BY TAXA_FRAUDE_PCT DESC;
 ```
@@ -217,56 +220,53 @@ Esses indicadores foram calculados sobre os resultados apresentados; não repres
 
 ## Workflows e frequência
 
+### Pipeline principal — 2 milhões de registros
+
+A ingestão inicial e as transformações Bronze → Silver → Gold foram executadas manualmente. As duas tasks em `CONTROL` são **independentes**, sem dependência entre si ou com a ingestão:
+
 | Task | Frequência | Ação |
 | --- | --- | --- |
-| `CONTROL.TASK_REFRESH_GOLD_EFICACIA` | Diariamente às 02:00 | Recria a Gold de eficácia a partir da Silver existente |
-| `CONTROL.TASK_RECALCULAR_THRESHOLDS` | Domingos às 03:00 | Executa a recalibração dos thresholds |
+| `CONTROL.TASK_REFRESH_GOLD_EFICACIA` | Diariamente às 02:00 | Recria somente `GOLD.EFICACIA_RISCO_PIX` a partir da Silver existente |
+| `CONTROL.TASK_RECALCULAR_THRESHOLDS` | Domingos às 03:00 | Recalibra os thresholds, sem reprocessar automaticamente Silver/Gold |
 
-Fuso configurado: `America/Sao_Paulo`. Warehouse utilizado: `COMPUTE_WH`.
+Fuso: `America/Sao_Paulo`; warehouse observado: `COMPUTE_WH` X-Small. Uma task concluída não mede o tempo do pipeline principal inteiro. A base estática não recebe novos dados automaticamente.
 
-Uma execução da task de eficácia apresentou estado `SUCCEEDED`, com duração exibida de aproximadamente 1 segundo. Essa medida pertence **somente àquela task**; não é o tempo de execução do pipeline completo.
+### Task Graph demonstrativo — amostra de 10 mil
 
-A frequência diária é uma proposta para consumo analítico em batch, não para autorização instantânea de pagamentos. A base estática não recebe novos dados automaticamente. A periodicidade semanal de calibração separa mudanças de parâmetros das atualizações de consumo e deve ser reavaliada conforme a disponibilidade de novos dados.
+`TASK_BRONZE → TASK_THRESHOLD_BOOTSTRAP → TASK_SILVER → TASK_GOLD` no schema `DEMO_GRAFO_PIX_20260921`. A raiz não possui agenda, permanece suspensa e é disparada manualmente; as três tasks dependentes ficam iniciadas. Na execução saudável observada: 10.000 registros Bronze, 10.000 Silver, 33 alertas Gold, quatro tasks `SUCCEEDED`. Os `RETURN_VALUE` exibem métricas de cada etapa no histórico do Snowsight. A demonstração não implementa ingestão incremental, descoberta de novos arquivos nem watermark. [Detalhes e consultas](docs/task-graph-demo.md).
 
 ## Preparação e ordem de execução
 
-Pré-requisitos: conta Snowflake, warehouse disponível, acesso ao arquivo Parquet e permissões para os objetos do projeto. As evidências foram produzidas em ambiente de estudo; uma implantação de produção deve usar funções de menor privilégio.
+Os SQLs em `sql/01_setup.sql` até `sql/08_access.sql` documentam o **pipeline principal**. Pré-requisitos: conta Snowflake, warehouse, Parquet e permissões; revisar nomes e DDL antes de executar em uma conta existente.
 
-1. Criar o banco `PIX_FRAUD_DB` e os schemas `BRONZE`, `SILVER`, `GOLD` e `CONTROL`.
-2. Carregar o Parquet em `BRONZE.PIX_TRANSACOES_RAW`.
-3. Inspecionar `VARIANT_COL` e estruturar `BRONZE.PIX_TRANSACOES`.
-4. Criar a primeira versão em `CONTROL.RISK_THRESHOLDS`.
-5. Executar a transformação de `SILVER.PIX_TRANSACOES`.
-6. Executar os quality checks e analisar seus resultados.
-7. Criar as três tabelas Gold e executar a consulta de negócio.
-8. Testar a falha em cópia temporária, sem modificar as tabelas principais.
-9. Criar a procedure e as duas tasks; verificar agendamento e histórico.
-10. Validar os acessos, coletar métricas e salvar evidências.
+1. `01_setup.sql`: banco, schemas, stage e tabela de checks.
+2. Carregar o Parquet via interface em `BRONZE.PIX_TRANSACOES_RAW` com `VARIANT_COL`; o stage criado no setup não foi comprovado como origem da carga.
+3. `02_bronze.sql`: estruturar a Bronze e conferir 2.000.000 de registros.
+4. `03_thresholds.sql`: criar a primeira versão de P95.
+5. `04_silver.sql`: gerar features, flags, score e nível de risco.
+6. `05_quality_checks.sql`: registrar e analisar PASS/FAIL; este script **não é um gate**.
+7. `06_gold.sql`: materializar eficácia, operacional e alertas.
+8. `07_tasks.sql` e `08_access.sql`: revisar agendamentos, procedure, roles e grants. Não executar cegamente `CREATE OR REPLACE TASK` em um ambiente já configurado.
 
-> Este README documenta o ambiente construído. Os scripts completos precisam ser exportados do Snowflake e adicionados ao repositório para permitir reprodução de ponta a ponta. Os exemplos de consulta aqui não substituem os scripts de implantação.
+O grafo de demonstração foi construído separadamente, no schema `DEMO_GRAFO_PIX_20260921`. Seu código completo ainda precisa ser exportado do ambiente, em particular o DDL de `BUILD_SILVER()`, para instalação reproduzível. O [runbook](docs/task-graph-demo.md) documenta objetos, operação e consultas de verificação. `sql/09_verificacao.sql` reúne apenas consultas de leitura. Não versionar dados nem credenciais.
 
-Evite recriar bancos ou schemas com `CREATE OR REPLACE` em ambientes que já contenham dados. Execute os comandos na ordem indicada e confira qual instrução está selecionada no editor.
+## Estrutura do repositório
 
-## Organização sugerida do repositório
+```text
+.
+├── README.md
+├── assets/diagrama_snowflake_pix.svg
+├── docs/
+│   ├── task-graph-demo.md
+│   ├── comparacao-databricks.md
+│   └── evidencias/README.md
+├── sql/
+│   ├── 01_setup.sql ... 08_access.sql   # pipeline principal
+│   └── 09_verificacao.sql               # consultas somente leitura
+└── tests/quality_failure.sql
+```
 
-Os caminhos abaixo são uma proposta de organização para os arquivos exportados, não uma afirmação de que todos já estejam publicados.
-
-| Caminho | Conteúdo esperado |
-| --- | --- |
-| `README.md` | Documentação do projeto |
-| `assets/diagrama_snowflake_pix.svg` | Diagrama de arquitetura |
-| `sql/01_setup.sql` | Banco, schemas e configuração |
-| `sql/02_bronze.sql` | Ingestão e estruturação |
-| `sql/03_thresholds.sql` | Calibração inicial |
-| `sql/04_silver.sql` | Features e regras de risco |
-| `sql/05_quality_checks.sql` | Checks e histórico |
-| `sql/06_gold.sql` | Tabelas de consumo |
-| `sql/07_tasks.sql` | Procedure e agendamentos |
-| `sql/08_access.sql` | Roles e privilégios |
-| `tests/quality_failure.sql` | Teste isolado de falha |
-| `docs/evidencias/` | Prints das execuções e resultados |
-
-Não versionar credenciais nem incluir a base completa por padrão. Preferir o link da fonte, acompanhado de versão ou checksum do arquivo utilizado.
+Os scripts `01`–`08` representam o fluxo principal; o Task Graph foi criado no Snowflake durante a demonstração e ainda não possui um instalador SQL completo neste repositório. Essa distinção evita prometer reprodução automática que o código publicado ainda não oferece. As capturas devem seguir a [lista de evidências](docs/evidencias/README.md).
 
 ## Governança e sustentabilidade
 
@@ -297,22 +297,20 @@ Versionar os scripts, registrar dependências, documentar a recuperação de fal
 
 ## Comparação com Databricks
 
-A arquitetura e o caso de uso são compartilhados, mas o grau de automação ainda é diferente. As características Databricks abaixo são documentadas no [README de Gabriel](https://github.com/GahRizzo/pix-fraud-databricks/blob/main/README.md).
+Os dois projetos usam Bronze → Silver → Gold, mas têm garantias operacionais diferentes. A comparação detalhada, baseada no [repositório Databricks](https://github.com/GahRizzo/pix-fraud-databricks), está em [docs/comparacao-databricks.md](docs/comparacao-databricks.md).
 
-| Dimensão | Snowflake deste projeto | Databricks de referência |
-| --- | --- | --- |
-| Desenvolvimento | SQL na interface web | PySpark, Delta Lake e pacote Python |
-| Facilidade de uso | Adequado à exploração SQL; houve ajustes de carga e acesso a VARIANT | Estrutura de código, dependências e deploy por DAB; tempo de aprendizado a medir |
-| Ingestão | Upload inicial e transformação em tabelas | Parquet em Volume, controle de arquivos e MERGE |
-| Processamento | Reconstrução de tabelas no protótipo | Batch incremental com watermarks |
-| Qualidade | Checks persistidos; bloqueio automático pendente | Quality gate interrompe a persistência da Silver |
-| Orquestração | Duas tasks independentes, com escopo parcial | Workflow diário encadeado e job semanal |
-| Governança | Schemas, role analítica, histórico de checks e thresholds | Unity Catalog, controles de ingestão e versionamento de parâmetros |
-| Versionamento do código | Exportação dos scripts para Git ainda necessária | Código e configuração DAB no repositório |
-| Performance | Evidência pontual da task Gold; benchmark completo pendente | Medição comparável pendente |
-| Custo | Créditos de warehouse e armazenamento, entre componentes aplicáveis | Consumo serverless em DBUs e demais componentes aplicáveis |
+| Dimensão | Snowflake principal | Snowflake demo | Databricks |
+| --- | --- | --- | --- |
+| Escala observada | 2.000.000 | 10.000 | Configuração incremental; volume depende dos arquivos disponíveis |
+| Ingestão | Upload inicial + CTAS | Amostra da RAW; `SOURCE_FILE` literal | Arquivos novos em Volume + controle + MERGE |
+| Orquestração | 2 tasks independentes e parciais | Grafo manual de 4 tasks | Workflow diário encadeado e job semanal |
+| Threshold | Versão inicial + recalibração semanal | P95 recalculado em cada run, `v_demo` | Bootstrap se faltar ativo + recalibração semanal |
+| Silver | CTAS batch | CTAS com exceção de qualidade | MERGE incremental após quality gate |
+| Falha de qualidade | PASS/FAIL registrado, sem bloqueio Gold | Bloqueia Gold; Silver já substituída | Impede persistência Silver e avanço do watermark |
+| Gold | 3 tabelas | Somente alertas `score >= 3` | 2 snapshots + alertas incrementais |
+| Watermark | Não implementado | Não implementado | Silver e Gold usam watermarks |
 
-Diferenças de implementação não são limitações inerentes das plataformas. A comparação precisa medir cargas e regras equivalentes antes de atribuir vantagens de custo ou desempenho.
+As saídas numéricas não devem ser tratadas como benchmark de plataforma sem alinhar amostra, regras, ambiente e custo.
 
 ## Custos
 
@@ -351,18 +349,18 @@ Faltam os consumos e preços efetivos das duas contas para concluir a comparaç�
 - **Reconciliar as features:** na fonte, a proporção do recebedor usa `valor / (valor + saldo_anterior)`; na Silver construída, foi usada `valor / saldo_anterior`. Calibrar na Bronze com uma fórmula e comparar na Silver com outra compromete o significado do P95.
 - **Unificar as regras temporais:** a fonte descreve outro intervalo noturno; a Silver utiliza horas ≤ 5 ou ≥ 22. Documentar a regra de negócio escolhida sem apresentá-la como regra regulatória validada.
 - **Validar paridade:** utilizar o mesmo arquivo, fórmulas, thresholds e política para nulos nas duas plataformas; reconciliar contagens e agregações.
-- **Automatizar o fluxo completo:** encadear ingestão, Silver, checks e todas as saídas Gold, com interrupção em caso de falha.
+- **Automatizar o fluxo principal:** o grafo da demo prova a orquestração em amostra isolada; ainda falta encadear ingestão, Silver, checks e todas as saídas Gold dos 2 milhões.
 - **Implementar incrementalidade:** controle de arquivos, checksum, chave confiável, MERGE e checkpoints. A reconstrução atual não equivale à idempotência incremental do projeto Databricks.
 - **Proteger a recalibração:** testar atomicidade, concorrência e recuperação da publicação de thresholds; garantir exatamente uma versão ativa.
 - **Ampliar testes:** duplicatas, datas inválidas, nulos, divisões por zero e reconciliação dos valores agregados.
 - **Medir performance:** repetir testes equivalentes, distinguir cache e inicialização e comparar tempo total e consumo, não apenas uma consulta.
-- **Concluir evidências:** publicar os SQLs, prints, teste FAIL, acessos efetivos e custos medidos.
+- **Concluir reprodutibilidade:** exportar o DDL integral das tasks e da procedure da demo; publicar prints de sucesso/falha, acessos efetivos e custos medidos.
 
 ## Conclusão
 
 O Snowflake demonstrou capacidade de transformar e agregar os 2 milhões de registros usando SQL, mantendo parâmetros de risco e um histórico de qualidade. Para um cenário predominantemente analítico e uma equipe orientada a SQL, é uma opção a considerar.
 
-Entretanto, **a implementação Databricks de referência está mais completa em incrementalidade e orquestração**. Para operar o pipeline tal como documentado hoje, a recomendação técnica provisória é partir dela. A escolha definitiva entre plataformas permanece condicionada à correção das diferenças de regras e à comparação de custo e desempenho sob condições equivalentes.
+O Task Graph demonstrativo agora comprova orquestração e interrupção da Gold no Snowflake. Entretanto, **a implementação Databricks de referência segue mais completa em incrementalidade e prevenção de persistência Silver inválida**. A escolha de plataforma depende de alinhar regras e medir custo, desempenho e governança sob condições equivalentes. A escolha definitiva entre plataformas permanece condicionada à correção das diferenças de regras e à comparação de custo e desempenho sob condições equivalentes.
 
 O principal resultado deste projeto é a demonstração do ciclo de engenharia de dados e de seus controles — não uma validação de regras antifraude para produção.
 
